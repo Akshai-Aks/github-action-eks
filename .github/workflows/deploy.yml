@@ -16,8 +16,6 @@ permissions:
 env:
   AWS_REGION: us-east-1
   CLUSTER_NAME: eks-acg
-  # Replace with the ARN of the role you created (IAM > Roles > github-actions-eks-deploy)
-  ROLE_ARN: arn:aws:iam::322593434164:role/github-actions-eks-deploy
 
 jobs:
   deploy:
@@ -29,7 +27,7 @@ jobs:
       - name: Configure AWS credentials (OIDC, keyless)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Update kubeconfig
@@ -42,3 +40,4 @@ jobs:
 
       - name: Show resources
         run: kubectl get deploy,pod,svc -n default -l app=nginx
+        
