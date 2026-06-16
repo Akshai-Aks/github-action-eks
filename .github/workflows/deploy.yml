@@ -1,0 +1,45 @@
+name: Deploy nginx to EKS
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'k8s/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# OIDC: id-token write is REQUIRED for keyless AWS auth.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: eks-acg
+  # Replace with the ARN of the role you created (IAM > Roles > github-actions-eks-deploy)
+  ROLE_ARN: arn:aws:iam::<ACCOUNT_ID>:role/github-actions-eks-deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC, keyless)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Deploy nginx
+        run: |
+          kubectl apply -f k8s/nginx-deployment.yaml
+          kubectl rollout status deployment/nginx -n default --timeout=120s
+
+      - name: Show resources
+        run: kubectl get deploy,pod,svc -n default -l app=nginx
+        
