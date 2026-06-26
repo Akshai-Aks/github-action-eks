@@ -33,20 +33,51 @@ SM_SECRET_NAME: eks/nginx-app/secret
 SM_CONFIG_NAME: eks/nginx-app/config
 ```
 
-## 2. What the pipeline does (step by step)
+## 2. What the pipeline does — two stages (jobs)
+
+The workflow is split into **two GitHub Actions jobs**, which appear as two
+stages in the Actions UI:
+
+```
+┌──────────────────────────┐        needs: build         ┌──────────────────────────┐
+│  STAGE 1: build          │  ─────────────────────────► │  STAGE 2: deploy         │
+│  build image -> ECR      │   passes image URI via      │  secrets sync + rollout  │
+│  output: image=<uri:sha> │   job output                │  uses needs.build.outputs│
+└──────────────────────────┘                             └──────────────────────────┘
+```
+
+Why split? Separation of concerns and a clean dependency: `deploy` only runs if
+`build` succeeds (`needs: build`). Each job runs on its **own fresh runner**, so
+each re-checks out the repo and authenticates to AWS via OIDC independently. The
+image tag built in stage 1 is handed to stage 2 through a **job output**
+(`build.outputs.image` → `needs.build.outputs.image`).
+
+### STAGE 1 — `build`
 
 | Step | Action | Depends on |
 |------|--------|-----------|
 | Checkout | Pull repo source | — |
 | Configure AWS credentials (OIDC) | Assume `github-actions-eks-deploy` via the OIDC token | [docs/02](02-iam-oidc-github.md) |
-| Resolve AWS account id | `sts get-caller-identity` → used to build image URI | — |
 | Login to Amazon ECR | `docker login` to your registry | [docs/01](01-ecr.md) |
-| Build and push image | `docker build` → push `:<sha>` and `:latest` | ECR repo exists |
+| Build and push image | `docker build` → push `:<sha>` and `:latest`; **export `image` output** | ECR repo exists |
+
+### STAGE 2 — `deploy` (`needs: build`)
+
+| Step | Action | Depends on |
+|------|--------|-----------|
+| Checkout | Re-pull repo (fresh runner) for the k8s manifests | — |
+| Configure AWS credentials (OIDC) | Fresh OIDC login on the new runner | [docs/02](02-iam-oidc-github.md) |
+| Resolve AWS account id | `sts get-caller-identity` → fills the IRSA role ARN | — |
 | Update kubeconfig | Point `kubectl` at `eks-acg` | EksDescribe perm |
 | Fetch values from Secrets Manager | Download both JSON secrets, **mask** values in logs | [docs/05](05-secrets-manager.md) |
-| Create namespace, ConfigMap and Secret | `jq` → `--from-literal` → idempotent apply | access entry |
-| Deploy to EKS | Substitute account id + image, `kubectl apply` SA/Deployment/Service | [docs/03](03-eks-access-entry.md), [docs/04](04-irsa.md) |
+| Create namespace, ConfigMap and Secret | `jq` → `--from-env-file` → idempotent apply | access entry |
+| Deploy to EKS | Substitute account id + the **build-stage image**, `kubectl apply` SA/Deployment/Service | [docs/03](03-eks-access-entry.md), [docs/04](04-irsa.md) |
 | Wait for rollout & show status | `kubectl rollout status` + `get` | — |
+
+> **Note:** because the two jobs use different runners, passing data between
+> stages must go through **job outputs** (small strings like the image URI) or
+> **artifacts** (files). You can't rely on files written in `build` being
+> present in `deploy`.
 
 ## 3. Trigger the pipeline
 
