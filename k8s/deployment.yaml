@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# NGINX Deployment.
+#
+# How the Secret and ConfigMap are consumed (requirement):
+#   * envFrom.configMapRef -> every key in ConfigMap "nginx-config" becomes an
+#     environment variable in the container.
+#   * envFrom.secretRef    -> every key in Secret "nginx-secret" becomes an
+#     environment variable (Kubernetes base64-decodes it for you).
+#   * volumeMounts          -> the Secret is ALSO mounted as files under
+#     /etc/nginx-app/secret so you can demonstrate file-based consumption.
+#
+# The default NGINX welcome page is untouched: we never write to
+# /usr/share/nginx/html, so http://<pod>/ still returns "Welcome to nginx!".
+#
+# The image tag is rewritten by the CI pipeline to the freshly pushed ECR
+# image digest/tag. The placeholder below is only used for local `kubectl`.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: nginx-app
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      serviceAccountName: nginx-sa          # <- IRSA-enabled SA
+      containers:
+        - name: nginx
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/nginx-app:latest
+          ports:
+            - containerPort: 80
+          envFrom:
+            - configMapRef:
+                name: nginx-config           # non-sensitive config (from Secrets Manager)
+            - secretRef:
+                name: nginx-secret           # sensitive values (from Secrets Manager)
+          volumeMounts:
+            - name: secret-files
+              mountPath: /etc/nginx-app/secret
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: secret-files
+          secret:
+            secretName: nginx-secret

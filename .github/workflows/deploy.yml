@@ -1,0 +1,140 @@
+# =============================================================================
+# CI/CD: Build -> Push to ECR -> Sync secrets -> Deploy to EKS
+#
+# Auth model: KEYLESS via GitHub OIDC. We never store AWS access keys in GitHub.
+#   GitHub mints a short-lived OIDC token -> aws-actions/configure-aws-credentials
+#   exchanges it for temporary STS credentials by assuming an IAM role you
+#   created (see docs/02-iam-oidc-github.md).
+#
+# Required GitHub repo settings (Settings -> Secrets and variables -> Actions):
+#   Secrets:
+#     AWS_ROLE_ARN  = arn:aws:iam::<acct>:role/github-actions-eks-deploy
+#   (everything else is non-secret and lives in `env:` below)
+# =============================================================================
+name: Build and Deploy NGINX to EKS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}        # lets you run it manually from the Actions tab
+
+# OIDC requires id-token: write. contents: read is enough to checkout.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: eks-acg
+  ECR_REPOSITORY: nginx-app
+  K8S_NAMESPACE: nginx-app
+  # Names of the secrets you created in AWS Secrets Manager:
+  SM_SECRET_NAME: eks/nginx-app/secret      # -> becomes K8s Secret    "nginx-secret"
+  SM_CONFIG_NAME: eks/nginx-app/config      # -> becomes K8s ConfigMap "nginx-config"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # ---------------------------------------------------------------------
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # Assume the deploy role via OIDC. No long-lived keys involved.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AWS account id
+        id: acct
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Log the Docker client into ECR using the temporary STS creds.
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---------------------------------------------------------------------
+      # Build the image and tag it two ways:
+      #   - immutable tag = git SHA  (what we actually deploy; reproducible)
+      #   - convenience tag = latest (human-friendly; do not rely on it)
+      - name: Build and push image to ECR
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE_SHA="$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::12}"
+          IMAGE_LATEST="$REGISTRY/$ECR_REPOSITORY:latest"
+          docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+          echo "image=$IMAGE_SHA" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Point kubectl at the cluster. The deploy role must have an EKS *access
+      # entry* (see docs/03-eks-access-entry.md) or this kubectl will 401.
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      # ---------------------------------------------------------------------
+      # Pull the two secrets from AWS Secrets Manager. Each is a JSON object,
+      # e.g. {"APP_API_KEY":"...","DB_PASSWORD":"..."}.
+      - name: Fetch values from AWS Secrets Manager
+        id: sm
+        run: |
+          aws secretsmanager get-secret-value --secret-id "$SM_SECRET_NAME" \
+            --query SecretString --output text > secret.json
+          aws secretsmanager get-secret-value --secret-id "$SM_CONFIG_NAME" \
+            --query SecretString --output text > config.json
+          # Mask every value so it never prints in the Actions log.
+          for v in $(jq -r '.[]' secret.json); do echo "::add-mask::$v"; done
+
+      # ---------------------------------------------------------------------
+      # Ensure the namespace exists, then (re)create the K8s ConfigMap + Secret
+      # from the JSON. `--dry-run=client -o yaml | kubectl apply -f -` is the
+      # idempotent "create or update" idiom -- safe to run on every deploy.
+      - name: Create namespace, ConfigMap and Secret
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+
+          # Convert each JSON object into a KEY=VALUE env file. --from-env-file
+          # is safe for values containing spaces (unlike unquoted --from-literal).
+          jq -r 'to_entries[] | "\(.key)=\(.value)"' config.json > config.env
+          jq -r 'to_entries[] | "\(.key)=\(.value)"' secret.json > secret.env
+
+          # ConfigMap (non-sensitive config).
+          kubectl create configmap nginx-config -n "$K8S_NAMESPACE" \
+            --from-env-file=config.env \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          # Secret (kubectl base64-encodes the values for you).
+          kubectl create secret generic nginx-secret -n "$K8S_NAMESPACE" \
+            --from-env-file=secret.env \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          rm -f secret.json config.json config.env secret.env  # no plaintext left on the runner
+
+      # ---------------------------------------------------------------------
+      # Substitute account id + image into the manifests, then apply.
+      - name: Deploy to EKS
+        env:
+          ACCOUNT_ID: ${{ steps.acct.outputs.id }}
+          IMAGE: ${{ steps.build.outputs.image }}
+        run: |
+          sed -i "s|<AWS_ACCOUNT_ID>|$ACCOUNT_ID|g" k8s/serviceaccount.yaml
+          kubectl apply -f k8s/serviceaccount.yaml
+
+          # Pin the deployment to the exact image we just pushed.
+          sed -i "s|image: .*nginx-app:.*|image: ${IMAGE}|g" k8s/deployment.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      # ---------------------------------------------------------------------
+      - name: Wait for rollout and show status
+        run: |
+          kubectl rollout status deployment/nginx -n "$K8S_NAMESPACE" --timeout=180s
+          kubectl get deploy,pod,svc,cm,secret -n "$K8S_NAMESPACE"

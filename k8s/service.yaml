@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------------------
+# ClusterIP Service.
+#
+# Requirement: "Do not create a Load Balancer, Ingress, or any external
+# exposure mechanism." => type: ClusterIP (the default). This gives the pods a
+# stable in-cluster DNS name (nginx.nginx-app.svc.cluster.local) reachable ONLY
+# from inside the cluster. No public IP, no ELB, no cost for exposure.
+#
+# To reach it from your laptop for testing, use `kubectl port-forward`
+# (see docs/08-verify-and-troubleshoot.md) -- that is a local tunnel, not an
+# external exposure mechanism on AWS.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: nginx-app
+  labels:
+    app: nginx
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

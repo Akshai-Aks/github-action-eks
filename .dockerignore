@@ -1,0 +1,7 @@
+# Keep the Docker build context tiny and reproducible.
+.git
+.github
+docs
+k8s
+*.md
+.gitignore

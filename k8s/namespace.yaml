@@ -1,0 +1,8 @@
+# A dedicated namespace isolates this workload from kube-system / default.
+# It makes RBAC, quotas, and cleanup ("kubectl delete ns nginx-app") trivial.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nginx-app
+  labels:
+    app.kubernetes.io/part-of: nginx-app
