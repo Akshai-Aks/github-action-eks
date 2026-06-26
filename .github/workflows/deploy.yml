@@ -1,5 +1,10 @@
 # =============================================================================
-# CI/CD: Build -> Push to ECR -> Sync secrets -> Deploy to EKS
+# CI/CD: Build -> Push to ECR  (stage 1)  ==>  Deploy to EKS  (stage 2)
+#
+# Two separate JOBS = two stages. `deploy` runs only after `build` succeeds
+# (needs: build) and consumes the image tag `build` produced via job outputs.
+# Each job runs on its own fresh runner, so each authenticates to AWS via OIDC
+# independently and re-checks out the repo.
 #
 # Auth model: KEYLESS via GitHub OIDC. We never store AWS access keys in GitHub.
 #   GitHub mints a short-lived OIDC token -> aws-actions/configure-aws-credentials
@@ -19,6 +24,7 @@ on:
   workflow_dispatch: {}        # lets you run it manually from the Actions tab
 
 # OIDC requires id-token: write. contents: read is enough to checkout.
+# Workflow-level permissions apply to every job below.
 permissions:
   id-token: write
   contents: read
@@ -33,14 +39,19 @@ env:
   SM_CONFIG_NAME: eks/nginx-app/config      # -> becomes K8s ConfigMap "nginx-config"
 
 jobs:
-  build-and-deploy:
+  # ===========================================================================
+  # STAGE 1 — BUILD: build the Docker image and push it to Amazon ECR.
+  # Exposes the pushed image URI as a job output for the deploy stage.
+  # ===========================================================================
+  build:
+    name: Build & push image to ECR
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}     # consumed by the deploy job
     steps:
-      # ---------------------------------------------------------------------
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------------------
       # Assume the deploy role via OIDC. No long-lived keys involved.
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -48,17 +59,11 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Resolve AWS account id
-        id: acct
-        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
-
-      # ---------------------------------------------------------------------
       # Log the Docker client into ECR using the temporary STS creds.
       - name: Login to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ---------------------------------------------------------------------
       # Build the image and tag it two ways:
       #   - immutable tag = git SHA  (what we actually deploy; reproducible)
       #   - convenience tag = latest (human-friendly; do not rely on it)
@@ -72,19 +77,42 @@ jobs:
           docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
           docker push "$IMAGE_SHA"
           docker push "$IMAGE_LATEST"
+          # Hand the exact image URI to the deploy stage.
           echo "image=$IMAGE_SHA" >> "$GITHUB_OUTPUT"
 
-      # ---------------------------------------------------------------------
+  # ===========================================================================
+  # STAGE 2 — DEPLOY: sync secrets from Secrets Manager and roll out to EKS.
+  # Runs only if STAGE 1 succeeded (needs: build) and reuses its image output.
+  # ===========================================================================
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: build                                  # <- the stage dependency
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}     # <- image from the build stage
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4                 # fresh runner: need the k8s manifests
+
+      # Fresh runner = fresh OIDC login.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AWS account id
+        id: acct
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
+
       # Point kubectl at the cluster. The deploy role must have an EKS *access
       # entry* (see docs/03-eks-access-entry.md) or this kubectl will 401.
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
 
-      # ---------------------------------------------------------------------
       # Pull the two secrets from AWS Secrets Manager. Each is a JSON object,
       # e.g. {"APP_API_KEY":"...","DB_PASSWORD":"..."}.
       - name: Fetch values from AWS Secrets Manager
-        id: sm
         run: |
           aws secretsmanager get-secret-value --secret-id "$SM_SECRET_NAME" \
             --query SecretString --output text > secret.json
@@ -93,7 +121,6 @@ jobs:
           # Mask every value so it never prints in the Actions log.
           for v in $(jq -r '.[]' secret.json); do echo "::add-mask::$v"; done
 
-      # ---------------------------------------------------------------------
       # Ensure the namespace exists, then (re)create the K8s ConfigMap + Secret
       # from the JSON. `--dry-run=client -o yaml | kubectl apply -f -` is the
       # idempotent "create or update" idiom -- safe to run on every deploy.
@@ -118,24 +145,20 @@ jobs:
 
           rm -f secret.json config.json config.env secret.env  # no plaintext left on the runner
 
-      # ---------------------------------------------------------------------
       # Substitute account id + image into the manifests, then apply.
       - name: Deploy to EKS
         env:
           ACCOUNT_ID: ${{ steps.acct.outputs.id }}
-          IMAGE: ${{ steps.build.outputs.image }}
         run: |
           sed -i "s|<AWS_ACCOUNT_ID>|$ACCOUNT_ID|g" k8s/serviceaccount.yaml
           kubectl apply -f k8s/serviceaccount.yaml
 
-          # Pin the deployment to the exact image we just pushed.
+          # Pin the deployment to the exact image the build stage pushed.
           sed -i "s|image: .*nginx-app:.*|image: ${IMAGE}|g" k8s/deployment.yaml
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
 
-      # ---------------------------------------------------------------------
       - name: Wait for rollout and show status
         run: |
           kubectl rollout status deployment/nginx -n "$K8S_NAMESPACE" --timeout=180s
           kubectl get deploy,pod,svc,cm,secret -n "$K8S_NAMESPACE"
-
