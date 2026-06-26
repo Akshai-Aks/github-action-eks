@@ -20,3 +20,4 @@ LABEL org.opencontainers.image.title="nginx-app" \
 # nginx:alpine already EXPOSEs 80, runs nginx in the foreground, and ships a
 # working default.conf that serves the welcome page. Nothing else to do.
 EXPOSE 80
+
