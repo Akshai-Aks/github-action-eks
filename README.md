@@ -66,8 +66,9 @@ Verify → Troubleshooting.**
 
 > **Phase A — AWS Console (point-and-click).** Build the cloud foundation.
 
-1. **[Prerequisites & cluster sanity check](docs/00-architecture.md)** — confirm
-   your `eks-acg` cluster is reachable and install local tools.
+1. **[Create the EKS cluster & prerequisites](docs/00-architecture.md)** — create
+   `eks-acg` from the provided `eksctl` config (`cluster/cluster.yaml`) if you
+   haven't already, install local tools, and run a sanity check.
 2. **[Amazon ECR](docs/01-ecr.md)** — create the private image repository.
 3. **[GitHub OIDC + IAM deploy role](docs/02-iam-oidc-github.md)** — keyless CI auth.
 4. **[EKS access entry](docs/03-eks-access-entry.md)** — let the deploy role use `kubectl`.
@@ -89,6 +90,8 @@ Verify → Troubleshooting.**
 github-action-eks/
 ├── Dockerfile                     # FROM nginx:1.27-alpine (default page preserved)
 ├── .dockerignore
+├── cluster/
+│   └── cluster.yaml               # eksctl ClusterConfig (creates eks-acg)
 ├── .github/workflows/deploy.yml   # build -> ECR -> secrets sync -> EKS deploy
 ├── k8s/
 │   ├── namespace.yaml             # namespace: nginx-app

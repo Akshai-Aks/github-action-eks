@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# eksctl ClusterConfig for this project.
+#
+# Create the cluster with:
+#     eksctl create cluster -f cluster/cluster.yaml
+#
+# See docs/00-architecture.md for a line-by-line explanation of every field,
+# what it costs, and how to verify the result.
+# ---------------------------------------------------------------------------
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: eks-acg
+  region: us-east-1
+  version: "1.34"
+
+vpc:
+  cidr: 10.0.0.0/16
+  nat:
+    gateway: HighlyAvailable
+
+managedNodeGroups:
+  - name: eks-node-group-managed-nodes
+    instanceType: t3.medium
+    desiredCapacity: 3
+    privateNetworking: true
+
+availabilityZones:
+  - us-east-1a
+  - us-east-1b
+  - us-east-1c
